@@ -34,28 +34,28 @@ log_err()   { printf "${RED}✖${NC}  %s\n" "$1" >&2; }
 log_title() { printf "\n${BOLD}${CYAN}%s${NC}\n" "$1"; }
 
 usage() {
-    cat <<EOF
+        cat <<EOF
 gitacc — Smart GitHub account switcher
 
 Version:
     ${VERSION}
 
 Usage:
-  gitacc                    Interactive account selector
-  gitacc <name>             Switch to account <name>
-  gitacc list               List all configured accounts
-  gitacc add                Add a new account interactively
-  gitacc delete <name>      Delete an account
-  gitacc status             Show current repo and SSH state
+    gitacc                    Interactive account selector
+    gitacc <name>             Switch to account <name>
+    gitacc list               List all configured accounts
+    gitacc add                Add a new account interactively
+    gitacc delete <name>      Delete an account
+    gitacc status             Show current repo and SSH state
     gitacc help               Show this help
     gitacc --help             Show this help
     gitacc --version          Show the current version
 
 What it does when switching:
-  • Loads the right SSH key into ssh-agent
-  • Sets repo-level git user.name / user.email
-  • Rewrites the origin remote to use the matching GitHub SSH host alias
-  • Tests the GitHub SSH connection
+    • Loads the right SSH key into ssh-agent
+    • Sets repo-level git user.name / user.email
+    • Rewrites the origin remote to use the matching GitHub SSH host alias
+    • Tests the GitHub SSH connection
 EOF
 }
 
