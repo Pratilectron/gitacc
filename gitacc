@@ -98,6 +98,177 @@ DEFAULT
     fi
 }
 
+get_account_name_by_key() {
+    local target="$1"
+    local name key
+    while IFS= read -r name; do
+        key=$(expand_path "$(get_account_field "$name" key)")
+        if [[ "$key" == "$target" ]]; then
+            echo "$name"
+            return
+        fi
+    done < <(list_account_names)
+}
+
+sanitize_account_name() {
+    local raw="$1"
+    printf '%s' "$raw" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9._-]+/-/g; s/^[.-]+//; s/[.-]+$//; s/-+/-/g'
+}
+
+infer_account_name() {
+    local host_alias="$1" key_path="$2"
+    local candidate="${host_alias#github-}"
+    local key_name=""
+
+    candidate=$(sanitize_account_name "$candidate")
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return
+    fi
+
+    key_name=$(basename "$key_path")
+    key_name="${key_name#id_ed25519_}"
+    key_name="${key_name#id_rsa_}"
+    key_name="${key_name#id_ecdsa_}"
+    key_name="${key_name#id_}"
+    candidate=$(sanitize_account_name "$key_name")
+
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return
+    fi
+
+    echo "account"
+}
+
+resolve_unique_account_name() {
+    local base_name="$1" host_alias="$2" key_path="$3"
+    local candidate="$base_name"
+    local suffix=2
+    local existing_host=""
+    local existing_key=""
+
+    while account_exists "$candidate"; do
+        existing_host=$(get_account_field "$candidate" host_alias)
+        existing_key=$(expand_path "$(get_account_field "$candidate" key)")
+        if [[ "$existing_host" == "$host_alias" || "$existing_key" == "$key_path" ]]; then
+            echo "$candidate"
+            return
+        fi
+        candidate="${base_name}-${suffix}"
+        suffix=$((suffix + 1))
+    done
+
+    echo "$candidate"
+}
+
+infer_email_from_public_key() {
+    local key_path="$1"
+    local pub_path="${key_path}.pub"
+    local comment=""
+    local email=""
+
+    if [[ ! -f "$pub_path" ]]; then
+        return 1
+    fi
+
+    comment=$(awk '{ if (NF >= 3) { for (i = 3; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "") } }' "$pub_path")
+    if [[ -z "$comment" ]]; then
+        return 1
+    fi
+
+    email=$(printf '%s\n' "$comment" | grep -Eo '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | head -n 1 || true)
+    if [[ -z "$email" ]]; then
+        return 1
+    fi
+
+    echo "$email"
+}
+
+infer_full_name() {
+    local account_name="$1"
+    local global_name=""
+
+    global_name=$(git config --global user.name 2>/dev/null || true)
+    if [[ -n "$global_name" ]]; then
+        echo "$global_name"
+        return
+    fi
+
+    echo "$account_name"
+}
+
+list_detectable_github_hosts() {
+    if [[ ! -f "$SSH_CONFIG_FILE" ]]; then
+        return 0
+    fi
+
+    awk '
+        function flush_block() {
+            if (host != "" && host !~ /[*?]/ && hostname == "github.com" && identity != "") {
+                print host "|" identity
+            }
+        }
+        /^[[:space:]]*Host[[:space:]]+/ {
+            flush_block()
+            host = $2
+            hostname = ""
+            identity = ""
+            next
+        }
+        /^[[:space:]]*HostName[[:space:]]+/ { hostname = $2; next }
+        /^[[:space:]]*IdentityFile[[:space:]]+/ { identity = $2; next }
+        END { flush_block() }
+    ' "$SSH_CONFIG_FILE"
+}
+
+auto_detect_accounts() {
+    local host_alias=""
+    local key_path=""
+    local account_name=""
+    local full_name=""
+    local email=""
+    local imported_count=0
+
+    ensure_accounts_file
+
+    while IFS='|' read -r host_alias key_path; do
+        [[ -z "$host_alias" || -z "$key_path" ]] && continue
+
+        key_path=$(expand_path "$key_path")
+        [[ ! -f "$key_path" ]] && continue
+
+        if [[ -n "$(get_account_name_by_host_alias "$host_alias")" ]]; then
+            continue
+        fi
+
+        if [[ -n "$(get_account_name_by_key "$key_path")" ]]; then
+            continue
+        fi
+
+        account_name=$(infer_account_name "$host_alias" "$key_path")
+        account_name=$(resolve_unique_account_name "$account_name" "$host_alias" "$key_path")
+        email=$(infer_email_from_public_key "$key_path" || true)
+        full_name=$(infer_full_name "$account_name")
+
+        cat >> "$ACCOUNTS_FILE" <<EOF
+
+[${account_name}]
+name = ${full_name}
+email = ${email}
+key = ${key_path}
+host_alias = ${host_alias}
+EOF
+        imported_count=$((imported_count + 1))
+    done < <(list_detectable_github_hosts)
+
+    if [[ "$imported_count" -gt 0 ]]; then
+        log_info "Auto-detected ${imported_count} existing GitHub account(s) from ~/.ssh/config."
+    fi
+}
+
 has_accounts() {
     ensure_accounts_file
     grep -qE '^\[[^]]+\]$' "$ACCOUNTS_FILE"
@@ -408,9 +579,24 @@ rewrite_remote() {
 
 set_git_identity() {
     local name="$1" email="$2"
-    git config user.name "$name"
-    git config user.email "$email"
-    log_ok "Git identity set: ${name} <${email}>"
+
+    if [[ -n "$name" ]]; then
+        git config user.name "$name"
+    fi
+
+    if [[ -n "$email" ]]; then
+        git config user.email "$email"
+    fi
+
+    if [[ -n "$name" && -n "$email" ]]; then
+        log_ok "Git identity set: ${name} <${email}>"
+    elif [[ -n "$name" ]]; then
+        log_warn "Git user.name set to ${name}; user.email was left unchanged because the detected account has no email metadata."
+    elif [[ -n "$email" ]]; then
+        log_warn "Git user.email set to ${email}; user.name was left unchanged because the detected account has no name metadata."
+    else
+        log_warn "Detected account has no Git identity metadata. Repo git config was left unchanged."
+    fi
 }
 
 switch_ssh_key() {
@@ -1266,6 +1452,7 @@ cmd_status() {
 main() {
     ensure_accounts_file
     ensure_usage_file
+    auto_detect_accounts
 
     local cmd="${1:-}"
 
